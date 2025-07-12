@@ -6,6 +6,7 @@ from abc import abstractmethod
 from typing import Any, Literal, Optional, Union
 
 import torch
+import torch_npu
 import torch.nn as nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
@@ -27,6 +28,8 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            RowvLLMParameter)
 # yapf: enable
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.distributed.parallel_state import get_tp_group
+from vllm.forward_context import get_forward_context
 
 logger = init_logger(__name__)
 
@@ -1270,6 +1273,33 @@ class RowParallelLinear(LinearBase):
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
+    @staticmethod
+    def get_hcomm_info(group):
+        rank = torch.distributed.get_rank(group)
+        hcomm_info = None
+        if torch.__version__ > "2.0":
+            global_rank = torch.distributed.get_global_rank(group, rank)
+            hcomm_info = group._get_backend(torch.device("npu")).get_hccl_comm_name(
+                global_rank
+            )
+
+        else:
+            hcomm_info = group.get_hccl_comm_name(rank)
+        return hcomm_info
+    
+    @staticmethod
+    def is_prefill():
+        attn_metadata = get_forward_context().attn_metadata
+        is_prefill = False
+        if attn_metadata is None:
+        # for profile run
+            is_prefill = True
+        else:
+            # is_prefill = attn_metadata.num_prefills > 0 is_prefill ore
+            if hasattr(attn_metadata, 'attn_state') and attn_metadata.attn_state.value == 0:
+                is_prefill = True
+        return is_prefill
+    
     def forward(
         self, input_
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
@@ -1286,13 +1316,29 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self,
-                                                  input_parallel,
-                                                  bias=bias_)
+        tp_group = get_tp_group().device_group
+        hcomm_info = self.get_hcomm_info(tp_group)
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            if self.is_prefill():
+                output = torch_npu.npu_mm_all_reduce_base(
+                    input_parallel,
+                    self.weight.t(),
+                    hcomm_info,
+                    bias=bias_
+                )
+            else:
+                output_parallel = self.quant_method.apply(
+                    self,
+                    input_parallel,
+                    bias=bias_
+                )
+                output = tensor_model_parallel_all_reduce(output_parallel)
         else:
-            output = output_parallel
+            output = self.quant_method.apply(
+                self,
+                input_parallel,
+                bias=bias_
+            )
 
         output_bias = self.bias if self.skip_bias_add else None
 
