@@ -176,10 +176,12 @@ class Qwen2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, cos=cos, sin=sin, skip_index_select=True)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -240,6 +242,8 @@ class Qwen2DecoderLayer(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -253,6 +257,8 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            cos=cos,
+            sin=sin
         )
 
         # Fully Connected
@@ -329,6 +335,11 @@ class Qwen2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+            
+        self.rotary_emb = self.layers[0].self_attn.rotary_emb
+        
+        self.cos_sin_cache = self.rotary_emb.cos_sin_cache
+        print("self.cos_sin_cache_shape = ", self.cos_sin_cache.shape)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -350,9 +361,20 @@ class Qwen2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        last_dim = cos_sin.size()[-1]
+        cos, sin = cos_sin.reshape(-1, 2,
+                                   last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+        
+        cos = cos.view(1, -1, 1, last_dim).contiguous()
+        sin = sin.view(1, -1, 1, last_dim).contiguous()
+        
         for layer in self.layers[self.start_layer:self.end_layer]:
             hidden_states, residual = layer(
                 positions,
+                cos,
+                sin,
                 hidden_states,
                 residual,
             )
