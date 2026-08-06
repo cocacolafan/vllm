@@ -279,6 +279,7 @@ class ModelArchConfigConvertorBase:
             "pangu_ultra_moe_mtp",
             "bailing_hybrid",
             "bailing_hybrid_mtp",
+            "telechat4",
         ):
             # check is deepseek_v4 model
             if hasattr(self.hf_text_config, "compress_ratios"):

@@ -178,6 +178,10 @@ _TOOL_PARSERS_TO_REGISTER = {
         "step3p5_tool_parser",
         "Step3p5ToolParser",
     ),
+    "telechat4": (
+        "telechat4_tool_parser",
+        "TeleChat4ToolParser",
+    ),
     "inkling": (
         "inkling_tool_parser",
         "InklingEngineToolParser",
